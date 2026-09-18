@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
 import { JWT_SECRET_MIN_LENGTH } from "@/lib/config/auth-env";
 
 // A copy-and-run example that carries a password IS a published credential, whatever the
@@ -82,7 +81,13 @@ function documentationFiles(): string[] {
     if (statSync(path).isDirectory()) {
       for (const entry of readdirSync(path)) {
         if (entry === "node_modules" || entry === "dist") continue;
-        walk(join(path, entry));
+        // Built with a forward slash rather than join(), which spells a path with
+        // backslashes on Windows. Node reads either, but everything downstream compares
+        // against forward slashes: READABLE's `(^|/)` anchors, and the `.github/workflows/`
+        // prefix that exempts the CI build placeholders. With backslashes that prefix never
+        // matched, so CI's own test values were reported as published credentials and this
+        // guard failed on windows-latest alone.
+        walk(`${path}/${entry}`);
       }
     } else if (READABLE.test(path)) {
       out.push(path);
