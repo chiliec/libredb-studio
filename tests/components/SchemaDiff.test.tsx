@@ -155,8 +155,17 @@ const mockSnapshots = [
   },
 ];
 
-const mockGetSchemaSnapshots = mock(() => [...mockSnapshots]);
-const mockSaveSchemaSnapshot = mock(() => {});
+/**
+ * The store, as a store. The panel reads back what it just wrote, because the real one
+ * SWALLOWS a quota refusal - `saveSchemaSnapshot` returns nothing and `local-storage.ts`
+ * catches the error - so a mock that accepts a write and then answers without it would be
+ * testing the panel against a store that does not exist.
+ */
+const savedSnapshots: unknown[] = [];
+const mockGetSchemaSnapshots = mock(() => [...mockSnapshots, ...savedSnapshots]);
+const mockSaveSchemaSnapshot = mock((snapshot?: unknown) => {
+  if (snapshot !== undefined) savedSnapshots.push(snapshot);
+});
 const mockDeleteSchemaSnapshot = mock(() => {});
 const mockGetConnections = mock(() => [
   {
@@ -248,6 +257,7 @@ describe("SchemaDiff", () => {
     mockGenerateMigrationSQL.mockClear();
     mockGetSchemaSnapshots.mockClear();
     mockSaveSchemaSnapshot.mockClear();
+    savedSnapshots.length = 0;
     mockDeleteSchemaSnapshot.mockClear();
     mockGetConnections.mockClear();
     selectCallbacks.clear();
@@ -347,6 +357,95 @@ describe("SchemaDiff", () => {
   // ═══════════════════════════════════════════════════════════════════════════
 
   describe("snapshot controls", () => {
+    /**
+     * The same answer as `answerSchemaReads`, except the INVENTORY half is held open until
+     * the returned `release` is called.
+     *
+     * `provider-meta` still answers at once, so `readLiveSchema` gets all the way to the
+     * read that matters and stops THERE. The gate lives in this closure and not in
+     * `globalThis.fetch`, which is the point: the caller can swap `globalThis.fetch` for a
+     * second connection while this first read is suspended, and release it afterwards.
+     */
+    function holdSchemaRead(objects: Array<{ name: string }> = [{ name: "users" }], ok = true) {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const orig = globalThis.fetch;
+      globalThis.fetch = mock((url: string) =>
+        String(url).includes("provider-meta")
+          ? Promise.resolve({
+              ok: true,
+              json: () =>
+                Promise.resolve({
+                  capabilities: {
+                    queryLanguage: "sql",
+                    objectKinds: [{ id: "table", role: "relation", label: "Table", labelPlural: "Tables" }],
+                  },
+                }),
+            })
+          : held.then(() => ({
+              ok,
+              json: () =>
+                Promise.resolve(
+                  ok
+                    ? {
+                        objects: objects.map((o) => ({ name: o.name, kind: "table", path: ["public", o.name] })),
+                        details: objects.map((o) => ({
+                          path: ["public", o.name],
+                          columns: [],
+                          indexes: [],
+                          foreignKeys: [],
+                        })),
+                      }
+                    : { error: "the connection you left is gone" },
+                ),
+            })),
+      ) as unknown as typeof fetch;
+      return { release, restore: () => void (globalThis.fetch = orig) };
+    }
+
+    /**
+     * A snapshot now reads the database itself, so these tests have to answer that read.
+     * They did not before, when it froze whatever the panel happened to be holding — which
+     * is the defect: the sequence the Diff tab exists for (snapshot, change the database,
+     * compare) answered "No differences found" with the panel left open, because the
+     * snapshot and the other side were both the mount-time copy.
+     */
+    function answerSchemaReads(objects: Array<{ name: string }> = [{ name: "users" }]) {
+      const orig = globalThis.fetch;
+      const fetchMock = mock((url: string) =>
+        Promise.resolve(
+          url.includes("provider-meta")
+            ? {
+                ok: true,
+                json: () =>
+                  Promise.resolve({
+                    capabilities: {
+                      queryLanguage: "sql",
+                      objectKinds: [{ id: "table", role: "relation", label: "Table", labelPlural: "Tables" }],
+                    },
+                  }),
+              }
+            : {
+                ok: true,
+                json: () =>
+                  Promise.resolve({
+                    objects: objects.map((o) => ({ name: o.name, kind: "table", path: ["public", o.name] })),
+                    details: objects.map((o) => ({
+                      path: ["public", o.name],
+                      columns: [],
+                      indexes: [],
+                      foreignKeys: [],
+                    })),
+                  }),
+              },
+        ),
+      );
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      return { fetchMock, restore: () => void (globalThis.fetch = orig) };
+    }
+
     test("renders Snapshot button", () => {
       const { getByText } = renderDiff();
       expect(getByText("Snapshot")).toBeTruthy();
@@ -376,13 +475,17 @@ describe("SchemaDiff", () => {
       expect(queryByPlaceholderText("Label (optional)...")).toBeNull();
     });
 
-    test("Save button calls storage.saveSchemaSnapshot", () => {
+    test("Save button calls storage.saveSchemaSnapshot", async () => {
+      const { restore } = answerSchemaReads();
       const { getByText, getByPlaceholderText, queryByPlaceholderText } = renderDiff();
       fireEvent.click(getByText("Snapshot"));
 
       const input = getByPlaceholderText("Label (optional)...") as HTMLInputElement;
       changeInput(input, "My label");
-      fireEvent.click(getByText("Save"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      restore();
 
       expect(mockSaveSchemaSnapshot).toHaveBeenCalledTimes(1);
       const saved = (mockSaveSchemaSnapshot.mock.calls as unknown[][])[0][0] as Record<string, unknown>;
@@ -394,10 +497,14 @@ describe("SchemaDiff", () => {
       expect(queryByPlaceholderText("Label (optional)...")).toBeNull();
     });
 
-    test("Save with empty label sets label to undefined", () => {
+    test("Save with empty label sets label to undefined", async () => {
+      const { restore } = answerSchemaReads();
       const { getByText } = renderDiff();
       fireEvent.click(getByText("Snapshot"));
-      fireEvent.click(getByText("Save"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      restore();
 
       expect(mockSaveSchemaSnapshot).toHaveBeenCalledTimes(1);
       expect(
@@ -405,15 +512,420 @@ describe("SchemaDiff", () => {
       ).toBeUndefined();
     });
 
-    test("Enter key in label input triggers snapshot save", () => {
+    test("Enter key in label input triggers snapshot save", async () => {
+      const { restore } = answerSchemaReads();
       const { getByText, getByPlaceholderText } = renderDiff();
       fireEvent.click(getByText("Snapshot"));
 
       const input = getByPlaceholderText("Label (optional)...") as HTMLInputElement;
       changeInput(input, "Enter label");
-      fireEvent.keyDown(input, { key: "Enter" });
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "Enter" });
+      });
+      restore();
 
       expect(mockSaveSchemaSnapshot).toHaveBeenCalledTimes(1);
+    });
+
+    test("records what the database holds NOW, not what the panel read when it opened", async () => {
+      // The whole point of the tab: snapshot, change the database, compare. With the panel
+      // left open that answered "No differences found", because the snapshot froze the
+      // mount-time copy and so did the other side. The panel is mounted here, the database
+      // gains a table, and the snapshot has to carry it.
+      const first = answerSchemaReads([{ name: "users" }]);
+      const { getByText } = renderDiff();
+      await act(async () => {});
+      first.restore();
+
+      const second = answerSchemaReads([{ name: "users" }, { name: "added_after_open" }]);
+      fireEvent.click(getByText("Snapshot"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      second.restore();
+
+      expect(mockSaveSchemaSnapshot).toHaveBeenCalledTimes(1);
+      const saved = (mockSaveSchemaSnapshot.mock.calls as unknown[][])[0][0] as { schema: Array<{ name: string }> };
+      expect(saved.schema.map((o) => o.name).sort()).toEqual(["added_after_open", "users"]);
+    });
+
+    test("saves nothing when that read fails, and says why", async () => {
+      const first = answerSchemaReads([{ name: "users" }]);
+      const { getByText, findByText } = renderDiff();
+      await act(async () => {});
+      first.restore();
+
+      const orig = globalThis.fetch;
+      globalThis.fetch = mock(() =>
+        Promise.resolve({ ok: false, json: () => Promise.resolve({ error: "the database refused the read" }) }),
+      ) as unknown as typeof fetch;
+      fireEvent.click(getByText("Snapshot"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      globalThis.fetch = orig;
+
+      // A stale snapshot is the defect again with a longer fuse, so nothing is written.
+      expect(mockSaveSchemaSnapshot).not.toHaveBeenCalled();
+      expect(await findByText(/No snapshot was saved: the database refused the read/)).toBeTruthy();
+    });
+
+    test("Enter twice saves once, not twice", async () => {
+      const { restore } = answerSchemaReads();
+      const { getByText, getByPlaceholderText } = renderDiff();
+      await act(async () => {});
+      fireEvent.click(getByText("Snapshot"));
+      const input = getByPlaceholderText("Label (optional)...") as HTMLInputElement;
+
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "Enter" });
+        fireEvent.keyDown(input, { key: "Enter" });
+      });
+      restore();
+
+      expect(mockSaveSchemaSnapshot).toHaveBeenCalledTimes(1);
+    });
+
+    test("a storage refusal unlocks the button and says so", async () => {
+      // Snapshots live in localStorage and a snapshot is a whole schema, so a quota refusal
+      // is ordinary. Before the `finally`, this left the button reading "Reading..." for the
+      // life of the panel with nothing on screen explaining it.
+      const { restore } = answerSchemaReads();
+      mockSaveSchemaSnapshot.mockImplementationOnce(() => {
+        throw new Error("the browser refused to store it");
+      });
+      const { getByText, findByText, queryByText } = renderDiff();
+      await act(async () => {});
+      fireEvent.click(getByText("Snapshot"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      restore();
+
+      expect(await findByText(/No snapshot was saved: the browser refused to store it/)).toBeTruthy();
+      expect(queryByText("Reading...")).toBeNull();
+      expect(getByText("Save")).toBeTruthy();
+    });
+
+    test("says a snapshot failed even while the panel's own read is failing too", async () => {
+      // Two different facts: what Current Schema means, and whether the thing you just
+      // pressed wrote anything. Only the first used to reach the screen.
+      const orig = globalThis.fetch;
+      globalThis.fetch = mock(() =>
+        Promise.resolve({ ok: false, json: () => Promise.resolve({ error: "the database is unreachable" }) }),
+      ) as unknown as typeof fetch;
+
+      const { getByText, findByText } = renderDiff();
+      await act(async () => {});
+      fireEvent.click(getByText("Snapshot"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      globalThis.fetch = orig;
+
+      expect(mockSaveSchemaSnapshot).not.toHaveBeenCalled();
+      expect(await findByText(/Current Schema is the explorer's last copy/)).toBeTruthy();
+      expect(await findByText(/No snapshot was saved: the database is unreachable/)).toBeTruthy();
+    });
+
+    test("the same read becomes Current Schema, not just the snapshot", async () => {
+      // The other half of this change: the read a snapshot makes is also stored as the
+      // panel's own copy, so the snapshot and the side it will be compared against are the
+      // same instant. Asserted through the error banner, which is what `liveRead` drives:
+      // after a successful snapshot read the panel is no longer falling back to the
+      // explorer's copy, even though the read it did on mount had failed.
+      const orig = globalThis.fetch;
+      globalThis.fetch = mock(() =>
+        Promise.resolve({ ok: false, json: () => Promise.resolve({ error: "mount read failed" }) }),
+      ) as unknown as typeof fetch;
+      const { getByText, findByText, queryByText } = renderDiff();
+      expect(await findByText(/Current Schema is the explorer's last copy/)).toBeTruthy();
+
+      const { restore } = answerSchemaReads([{ name: "users" }, { name: "added_after_open" }]);
+      fireEvent.click(getByText("Snapshot"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      restore();
+      globalThis.fetch = orig;
+
+      expect(mockSaveSchemaSnapshot).toHaveBeenCalledTimes(1);
+      // The banner is gone, which it can only be because the snapshot's read replaced the
+      // failed one as Current Schema.
+      expect(queryByText(/Current Schema is the explorer's last copy/)).toBeNull();
+    });
+
+    test("the Save button is disabled while its read is in flight", async () => {
+      const { restore } = answerSchemaReads();
+      let release: (() => void) | undefined;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const orig = globalThis.fetch;
+      const passthrough = globalThis.fetch;
+      globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("inventory")) await held;
+        return passthrough(url as never, init as never);
+      }) as unknown as typeof fetch;
+
+      const { getByText, container } = renderDiff();
+      fireEvent.click(getByText("Snapshot"));
+      let pending: Promise<unknown> | undefined;
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+        pending = Promise.resolve();
+        await pending;
+      });
+
+      const saving = Array.from(container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("Reading..."),
+      );
+      expect(saving?.disabled).toBe(true);
+      // The label and Cancel go with it: a label typed now would not reach the snapshot the
+      // read is already building, and Cancel would close the panel over a save that is still
+      // going to happen.
+      expect((container.querySelector("input[placeholder='Label (optional)...']") as HTMLInputElement).disabled).toBe(
+        true,
+      );
+      expect(
+        Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Cancel"))?.disabled,
+      ).toBe(true);
+
+      release?.();
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      globalThis.fetch = orig;
+      restore();
+    });
+
+    test("a snapshot read that lands after the connection changed saves nothing and is not kept", async () => {
+      // A read is not instant - it opens a connection and asks a catalog - and the panel
+      // stays usable while it runs, so the user can switch connections inside that window.
+      // The mount effect has a `cancelled` flag for exactly this; the snapshot's own read
+      // needs the same check, or its late answer is written as the CURRENT connection's
+      // Current Schema, the identity test then rejects it, and the panel falls silently back
+      // to the explorer's copy with no banner - #884 again, on a connection the user is
+      // looking at right now.
+      const origFetch = globalThis.fetch;
+      try {
+        const a = answerSchemaReads([{ name: "a_table" }]);
+        let view!: ReturnType<typeof render>;
+        await act(async () => {
+          view = renderDiff();
+        });
+        a.restore();
+
+        // Save is pressed on A, and THAT read is held open.
+        const heldA = holdSchemaRead([{ name: "a_table" }]);
+        fireEvent.click(view.getByText("Snapshot"));
+        await act(async () => {
+          fireEvent.click(view.getByText("Save"));
+        });
+
+        // While it is still in flight the user switches to B, whose own read lands.
+        const b = answerSchemaReads([{ name: "b_table" }]);
+        await act(async () => {
+          view.rerender(<SchemaDiff schema={mockSchema} connection={mockMySQLConnection} />);
+        });
+        b.restore();
+
+        mockSaveSchemaSnapshot.mockClear();
+        await act(async () => {
+          heldA.release();
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        heldA.restore();
+
+        // Nothing is written for a connection the user has left.
+        expect(mockSaveSchemaSnapshot).not.toHaveBeenCalled();
+
+        // And B's own read is still what Current Schema means.
+        mockDiffSchemas.mockClear();
+        changeSource("snap-1");
+        changeTarget("current");
+        const current = (mockDiffSchemas.mock.calls as unknown[][]).at(-1)?.[1] as Array<{ name: string }>;
+        expect(current.map((o) => o.name)).toEqual(["b_table"]);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    test("a snapshot read that FAILS after the connection changed leaves the new one alone", async () => {
+      // The same window, the other outcome. Writing the old connection's failure onto the
+      // new one would put a banner about a database the user is no longer looking at over a
+      // panel that is working.
+      const origFetch = globalThis.fetch;
+      try {
+        const a = answerSchemaReads([{ name: "a_table" }]);
+        let view!: ReturnType<typeof render>;
+        await act(async () => {
+          view = renderDiff();
+        });
+        a.restore();
+
+        const heldA = holdSchemaRead([], false);
+        fireEvent.click(view.getByText("Snapshot"));
+        await act(async () => {
+          fireEvent.click(view.getByText("Save"));
+        });
+
+        const b = answerSchemaReads([{ name: "b_table" }]);
+        await act(async () => {
+          view.rerender(<SchemaDiff schema={mockSchema} connection={mockMySQLConnection} />);
+        });
+        b.restore();
+
+        await act(async () => {
+          heldA.release();
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        heldA.restore();
+
+        expect(view.queryByText(/the connection you left is gone/)).toBeNull();
+        mockDiffSchemas.mockClear();
+        changeSource("snap-1");
+        changeTarget("current");
+        const current = (mockDiffSchemas.mock.calls as unknown[][]).at(-1)?.[1] as Array<{ name: string }>;
+        expect(current.map((o) => o.name)).toEqual(["b_table"]);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    test("snapshot, change the database, compare - the sequence the tab exists for", async () => {
+      // The whole claim, end to end, with the panel never closed. The earlier fix made the
+      // SNAPSHOT read fresh and stopped there, so the other side of the comparison was still
+      // frozen at the moment the snapshot was taken and the answer was "No differences
+      // found" all the same. Choosing a target is what reads again.
+      const a = answerSchemaReads([{ name: "users" }]);
+      const { getByText } = renderDiff();
+      await act(async () => {});
+      a.restore();
+
+      // A snapshot of the schema as it stands: read fresh, so it carries what is there now.
+      const b = answerSchemaReads([{ name: "users" }]);
+      fireEvent.click(getByText("Snapshot"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      b.restore();
+      const saved = (mockSaveSchemaSnapshot.mock.calls as unknown[][])[0][0] as {
+        schema: Array<{ name: string }>;
+      };
+      expect(saved.schema.map((o) => o.name)).toEqual(["users"]);
+
+      // The database gains a table, and a target is chosen WITHOUT leaving the tab.
+      const c = answerSchemaReads([{ name: "users" }, { name: "added_between" }]);
+      mockDiffSchemas.mockClear();
+      changeTarget("snap-1");
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      c.restore();
+
+      // Current Schema was read again, so the comparison sees the new table. Without the
+      // second read this side would still be the schema of the moment the snapshot was taken.
+      const [source] = (mockDiffSchemas.mock.calls as unknown[][]).at(-1) as [Array<{ name: string }>];
+      expect(source.map((o) => o.name).sort()).toEqual(["added_between", "users"]);
+    });
+
+    test("a snapshot overtaken on the SAME connection says so instead of vanishing", async () => {
+      // Choosing a target reads the connection too, so a snapshot in flight can be overtaken
+      // without the connection changing at all. Returning quietly there saved nothing and
+      // said nothing: the button went back to "Save" and the user believed it had saved.
+      const origFetch = globalThis.fetch;
+      try {
+        const a = answerSchemaReads([{ name: "users" }]);
+        let view!: ReturnType<typeof render>;
+        await act(async () => {
+          view = renderDiff();
+        });
+        a.restore();
+
+        const held = holdSchemaRead([{ name: "users" }]);
+        fireEvent.click(view.getByText("Snapshot"));
+        await act(async () => {
+          fireEvent.click(view.getByText("Save"));
+        });
+
+        // A target is chosen while that read is still out, which begins a newer one.
+        const b = answerSchemaReads([{ name: "users" }]);
+        await act(async () => {
+          changeTarget("snap-1");
+        });
+        b.restore();
+
+        mockSaveSchemaSnapshot.mockClear();
+        await act(async () => {
+          held.release();
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        held.restore();
+
+        expect(mockSaveSchemaSnapshot).not.toHaveBeenCalled();
+        expect(await view.findByText(/read again before this finished/)).toBeTruthy();
+        expect(view.queryByText("Reading...")).toBeNull();
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    test("a later successful read clears the banner a failed snapshot left", async () => {
+      const origFetch = globalThis.fetch;
+      try {
+        const a = answerSchemaReads([{ name: "users" }]);
+        let view!: ReturnType<typeof render>;
+        await act(async () => {
+          view = renderDiff();
+        });
+        a.restore();
+
+        globalThis.fetch = mock(() =>
+          Promise.resolve({ ok: false, json: () => Promise.resolve({ error: "the database blinked" }) }),
+        ) as unknown as typeof fetch;
+        fireEvent.click(view.getByText("Snapshot"));
+        await act(async () => {
+          fireEvent.click(view.getByText("Save"));
+        });
+        expect(await view.findByText(/No snapshot was saved: the database blinked/)).toBeTruthy();
+
+        // The panel reads this same database again - choosing a target does - and it works.
+        // The old banner is about a moment the user has already walked away from.
+        const c = answerSchemaReads([{ name: "users" }]);
+        await act(async () => {
+          changeTarget("snap-1");
+          await new Promise((r) => setTimeout(r, 0));
+        });
+        c.restore();
+
+        expect(view.queryByText(/No snapshot was saved/)).toBeNull();
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    test("comparing two snapshots reads no database at all", async () => {
+      const a = answerSchemaReads([{ name: "users" }]);
+      const { container } = renderDiff();
+      await act(async () => {});
+      a.restore();
+
+      const orig = globalThis.fetch;
+      const counted = mock(() =>
+        Promise.resolve({ ok: true, json: () => Promise.resolve({ objects: [], details: [] }) }),
+      );
+      globalThis.fetch = counted as unknown as typeof fetch;
+      await act(async () => {
+        changeSource("snap-1");
+        changeTarget("snap-1");
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      globalThis.fetch = orig;
+
+      // Two files against each other. A round trip here changes nothing either side shows.
+      expect(counted).not.toHaveBeenCalled();
+      expect(container).toBeTruthy();
     });
 
     test("takeSnapshot does nothing when connection is null", () => {
@@ -422,11 +934,15 @@ describe("SchemaDiff", () => {
       expect(mockSaveSchemaSnapshot).not.toHaveBeenCalled();
     });
 
-    test("snapshot save refreshes snapshot list", () => {
+    test("snapshot save refreshes snapshot list", async () => {
+      const { restore } = answerSchemaReads();
       const { getByText } = renderDiff();
       const callsBefore = mockGetSchemaSnapshots.mock.calls.length;
       fireEvent.click(getByText("Snapshot"));
-      fireEvent.click(getByText("Save"));
+      await act(async () => {
+        fireEvent.click(getByText("Save"));
+      });
+      restore();
       expect(mockGetSchemaSnapshots.mock.calls.length).toBeGreaterThan(callsBefore);
     });
   });
@@ -931,10 +1447,12 @@ describe("SchemaDiff", () => {
           fn!("conn:remote-1");
         });
 
-        // Four requests, not two: the panel reads the CURRENT schema when it opens (#884),
-        // which is the same pair. The two below are the remote selection's, picked out by the
-        // connection they name rather than by position, because the two reads interleave.
-        expect(mockFetch).toHaveBeenCalledTimes(4);
+        // Six requests, in three pairs: the panel reads the CURRENT schema when it opens
+        // (#884), it reads it AGAIN when a target is chosen, because that is the moment
+        // someone asks to be told the difference, and the remote selection is its own read.
+        // Picked out below by the connection they name rather than by position, because the
+        // reads interleave.
+        expect(mockFetch).toHaveBeenCalledTimes(6);
         const calls = mockFetch.mock.calls as unknown[][];
         const forRemote = calls.filter(([, init]) =>
           String((init as RequestInit | undefined)?.body ?? "").includes('"id":"remote-1"'),

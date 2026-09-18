@@ -1,7 +1,8 @@
 "use client";
 
 import { appFetch } from "@/lib/config/base-path";
-import React, { useState, useMemo, useCallback, useEffect } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useReadGeneration } from "@/hooks/use-read-generation";
 import {
   GitCompare,
   Plus,
@@ -85,32 +86,49 @@ export function SchemaDiff({ schema, connection }: SchemaDiffProps) {
   const [showMigration, setShowMigration] = useState(false);
   const [snapshotLabel, setSnapshotLabel] = useState("");
   const [showLabelInput, setShowLabelInput] = useState(false);
+  /** True while a snapshot's own read is in flight. State, because the button reads it. */
+  const [snapshotting, setSnapshotting] = useState(false);
+  /**
+   * The same fact as a ref, because the GUARD cannot read the state.
+   *
+   * Two Enter presses land in the same tick, before React has re-rendered, so both see the
+   * `snapshotting` the callback closed over — `false` — and both save. A ref is written and
+   * read synchronously, which is what a re-entrancy guard needs.
+   */
+  const snapshotInFlight = useRef(false);
+  /**
+   * The reason the last snapshot was not saved, and the connection it was about.
+   *
+   * Carried together for the reason `liveRead` is: a failure on the connection the user has
+   * left is not a failure of the one they are looking at, and a banner about the other
+   * database over a working panel is its own small lie. Derived rather than cleared by an
+   * effect, so there is no render where the wrong one is on screen.
+   */
+  const [snapshotFailure, setSnapshotFailure] = useState<{ connectionId: string; reason: string } | null>(null);
 
   /**
-   * The objects the database holds right now, read when this panel opens.
+   * Which read is the current one.
    *
-   * `schema` is the prop the explorer already had, and it is what "Current Schema" used to
-   * mean — so a diff taken right after a DDL change compared a copy of the schema from
-   * before the change and answered "No differences found" (#884). The panel is mounted when
-   * the user opens it, so reading here is the moment that matters for that sequence.
+   * Three things read this connection now - the panel opening, a snapshot, and a target
+   * being chosen to compare against - and any of them can settle after another has already
+   * started. A counter is what settles that, and the repository already states the rule
+   * once in `useReadGeneration`: begin a read, and every write it performs asks first
+   * whether it is still the one that matters.
    *
-   * `null` until the read lands, and the prop stands in meanwhile: an empty side would
-   * report every object as removed, which is worse than being briefly out of date.
+   * Comparing the connection OBJECT instead was the earlier attempt and it is not safe:
+   * `use-connection-adapter.ts` builds `activeConnection` with a `useMemo` over a prop the
+   * embedded host supplies, so a host that hands over a fresh array per render produces a
+   * fresh object per render, and a read would then be discarded on a connection that never
+   * changed - the snapshot silently not saved, with nothing on screen.
    */
+  const reads = useReadGeneration();
+
   /**
-   * The last read, and the connection it was a read OF.
+   * The objects the database holds, and the connection they were read FROM.
    *
-   * The connection is stored with the result rather than the result being cleared when the
-   * connection changes, because the panel outlives a switch: `BottomPanel` keeps it mounted,
-   * so holding the previous database's objects made "Current Schema" mean the OTHER
-   * connection until the new read landed, and for good if that read failed. `takeSnapshot`
-   * then wrote the new connection's id and type onto the old one's objects, which is the
-   * stale-copy defect #884 is about, kept for as long as the snapshot is.
-   *
-   * Carrying the connection makes a stale read unusable rather than something a second
-   * effect has to remember to clear, and it is keyed on the connection OBJECT — the same
-   * thing the effect depends on — so a read can never outlive the exact render that asked
-   * for it.
+   * Carried together rather than cleared on a switch, because the panel outlives one:
+   * holding the previous database's objects made "Current Schema" mean the OTHER connection
+   * until the new read landed, and for good if that read failed.
    *
    * `error` is the other half. The panel falls back to the explorer's copy, and that copy is
    * precisely what #884 is about, so the reason is state that reaches the screen rather than
@@ -122,64 +140,162 @@ export function SchemaDiff({ schema, connection }: SchemaDiffProps) {
     error: string | null;
   } | null>(null);
 
-  const readForThisConnection = liveRead?.connection === connection ? liveRead : null;
-
-  /**
-   * The objects the database holds right now, read when this panel opens.
-   *
-   * `schema` is the prop the explorer already had, and it is what "Current Schema" used to
-   * mean — so a diff taken right after a DDL change compared a copy of the schema from
-   * before the change and answered "No differences found" (#884). The panel is mounted when
-   * the user opens it, so reading here is the moment that matters for that sequence.
-   *
-   * `null` until the read lands, and the prop stands in meanwhile: an empty side would
-   * report every object as removed, which is worse than being briefly out of date.
-   */
+  const readForThisConnection = liveRead?.connection.id === connection?.id ? liveRead : null;
   const liveSchema = readForThisConnection?.objects ?? null;
   const liveSchemaError = readForThisConnection?.error ?? null;
+  const snapshotError =
+    snapshotFailure !== null && snapshotFailure.connectionId === connection?.id ? snapshotFailure.reason : null;
+
+  /**
+   * Begin a read of this connection, and hand back both the promise and the question every
+   * write it performs has to ask first.
+   *
+   * The write is left to the caller rather than done here, and deliberately: a `setState`
+   * reached through a helper called straight from an effect is what the React lint rules
+   * forbid, and the shape they accept - settle first, then write - is also the honest one,
+   * because the two callers want different things from a failure. The panel opening falls
+   * back to the explorer's copy and says so; a snapshot saves nothing at all.
+   */
+  const beginRead = useCallback(
+    (conn: DatabaseConnection) => ({ read: readLiveSchema(conn), isCurrent: reads.begin() }),
+    [reads],
+  );
 
   useEffect(() => {
     if (!connection) return;
-    let cancelled = false;
-    readLiveSchema(connection)
+    const { read, isCurrent } = beginRead(connection);
+    read
       .then((objects) => {
-        if (!cancelled) setLiveRead({ connection, objects, error: null });
+        if (!isCurrent()) return;
+        setLiveRead({ connection, objects, error: null });
+        // A reading of this database that worked settles the last one that did not: leaving
+        // it up meant a banner about a failure the user had already walked away from.
+        setSnapshotFailure((previous) => (previous?.connectionId === connection.id ? null : previous));
       })
       .catch((err) => {
         const reason = err instanceof Error ? err.message : String(err);
-        if (!cancelled) setLiveRead({ connection, objects: null, error: reason });
+        if (isCurrent()) setLiveRead({ connection, objects: null, error: reason });
         logger.warn("Failed to read the current schema for a diff; falling back to the explorer's copy", {
           route: "SchemaDiff",
           error: reason,
         });
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [connection]);
+  }, [connection, beginRead]);
+
+  /**
+   * A comparison reads the database again.
+   *
+   * Without this the panel answers the question it was opened with rather than the one being
+   * asked: take a snapshot, change the database, pick that snapshot as the target, and both
+   * sides are the moment of the snapshot - "No differences found" again, which is the whole
+   * defect wearing different clothes. The read happens when a target is CHOSEN, because that
+   * is the moment a person asks to be told the difference.
+   */
+  useEffect(() => {
+    // Only when one side of the comparison IS the database. Two snapshots against each
+    // other are two files; reading the connection for them is a round trip that changes
+    // nothing either side shows.
+    if (!connection || !targetId) return;
+    if (sourceId !== "current" && targetId !== "current") return;
+    const { read, isCurrent } = beginRead(connection);
+    read
+      .then((objects) => {
+        if (!isCurrent()) return;
+        setLiveRead({ connection, objects, error: null });
+        // Same rule as the read when the panel opens: a reading of this database that worked
+        // settles the last one that did not.
+        setSnapshotFailure((previous) => (previous?.connectionId === connection.id ? null : previous));
+      })
+      .catch((err) => {
+        const reason = err instanceof Error ? err.message : String(err);
+        // Falling back to the last copy rather than emptying the side, which would report
+        // every object as removed; the banner says why it may be out of date.
+        if (isCurrent()) setLiveRead({ connection, objects: null, error: reason });
+      });
+  }, [targetId, sourceId, connection, beginRead]);
 
   /** What "Current Schema" means on both sides of the diff, and in a new snapshot. */
   const currentSchema = liveSchema ?? schema;
 
-  // Take snapshot of current schema
-  const takeSnapshot = useCallback(() => {
-    if (!connection) return;
-    const snapshot: SchemaSnapshot = {
-      id: Date.now().toString(),
-      connectionId: connection.id,
-      connectionName: connection.name,
-      databaseType: connection.type,
-      // The live read, not the prop: a snapshot taken from a stale copy is stale for as
-      // long as it is kept, and it is kept to be compared against later (#884).
-      schema: JSON.parse(JSON.stringify(currentSchema)),
-      createdAt: new Date(),
-      label: snapshotLabel.trim() || undefined,
-    };
-    storage.saveSchemaSnapshot(snapshot);
-    setSnapshots(storage.getSchemaSnapshots());
-    setSnapshotLabel("");
-    setShowLabelInput(false);
-  }, [currentSchema, connection, snapshotLabel]);
+  /**
+   * Freeze the schema the database holds AT THIS MOMENT, not the one the panel read when
+   * it opened.
+   *
+   * #884 moved "Current Schema" off the explorer's copy and onto a read of the connection,
+   * but that read sits in an effect keyed on `[connection]` alone, so it happens once and
+   * not again for as long as the panel stays open. The sequence the Diff tab exists for —
+   * snapshot, change the database, compare — still answered "No differences found": the
+   * snapshot froze that first copy, and so did the other side of the comparison. Measured
+   * against PostgreSQL 16 with the panel left open. Leaving the tab and coming back was
+   * the only thing that helped, and it helped because `BottomPanel` mounts one view at a
+   * time, so returning is a remount and the effect runs again — not a step anyone would
+   * guess, and not one the panel tells you about.
+   *
+   * Reading here fixes both halves at once, because the same read becomes the new
+   * `liveRead`: the snapshot records the database, and the "Current Schema" it will be
+   * compared against is refreshed to the same instant.
+   *
+   * A read that fails saves NOTHING. A snapshot is kept to be compared against later, so a
+   * silently stale one is the defect again with a longer fuse; the banner says why and the
+   * label stays typed so the button can be pressed again.
+   */
+  const takeSnapshot = useCallback(async () => {
+    if (!connection || snapshotInFlight.current) return;
+    snapshotInFlight.current = true;
+    setSnapshotting(true);
+    setSnapshotFailure(null);
+    try {
+      // The same read that becomes "Current Schema", so the snapshot and the side it will
+      // be compared against are the same instant.
+      const { read, isCurrent } = beginRead(connection);
+      const objects = await read;
+      if (!isCurrent()) {
+        // Something asked for a newer read while this one was in flight - choosing a target
+        // does, on this same connection. Returning quietly here saved nothing and said
+        // nothing, so the button came back to "Save" and the user believed it had. The
+        // banner stays until the next attempt: a later read landing is not a snapshot, and
+        // clearing it on one put the silence straight back.
+        setSnapshotFailure({
+          connectionId: connection.id,
+          reason: "the schema was read again before this finished. Press Save again",
+        });
+        return;
+      }
+      setLiveRead({ connection, objects, error: null });
+      const snapshot: SchemaSnapshot = {
+        id: Date.now().toString(),
+        connectionId: connection.id,
+        connectionName: connection.name,
+        databaseType: connection.type,
+        schema: JSON.parse(JSON.stringify(objects)),
+        createdAt: new Date(),
+        label: snapshotLabel.trim() || undefined,
+      };
+      // Inside the try as well: snapshots live in localStorage and a snapshot is a whole
+      // schema, so a quota refusal is an ordinary outcome rather than an exotic one.
+      // Inside the try, so a write that throws reaches the same banner the read failure
+      // does rather than escaping as an unhandled rejection.
+      //
+      // It does NOT catch a full disk. `storage.saveSchemaSnapshot` returns nothing and
+      // `local-storage.ts` swallows the quota error, so a refused write is reported here as
+      // a snapshot taken. That is the store's to fix - every caller of it has the same
+      // problem and none of them can see the failure - and it predates this change.
+      storage.saveSchemaSnapshot(snapshot);
+      setSnapshots(storage.getSchemaSnapshots());
+      setSnapshotLabel("");
+      setShowLabelInput(false);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      setSnapshotFailure({ connectionId: connection.id, reason });
+      logger.warn("Nothing was saved for this snapshot", { route: "SchemaDiff", error: reason });
+    } finally {
+      // In `finally`, not at the end of each branch: a throw between them would otherwise
+      // leave the button reading "Reading..." for the life of the panel, with nothing on
+      // screen saying why, and `snapshotInFlight` stuck true so no later press does anything.
+      snapshotInFlight.current = false;
+      setSnapshotting(false);
+    }
+  }, [connection, snapshotLabel, beginRead]);
 
   // Delete snapshot
   const deleteSnapshot = useCallback(
@@ -385,16 +501,26 @@ export function SchemaDiff({ schema, connection }: SchemaDiffProps) {
               value={snapshotLabel}
               onChange={(e) => setSnapshotLabel(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && takeSnapshot()}
-              className="h-7 px-2 text-xs bg-fill border border-hairline-strong rounded text-fg-secondary focus:outline-none focus:border-brand-tint w-32"
+              disabled={snapshotting}
+              className="h-7 px-2 text-xs bg-fill border border-hairline-strong rounded text-fg-secondary focus:outline-none focus:border-brand-tint w-32 disabled:opacity-60"
               autoFocus
             />
-            <Button variant="ghost" size="sm" className="h-7 text-xs text-brand" onClick={takeSnapshot}>
-              {"Save"}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs text-brand"
+              onClick={takeSnapshot}
+              disabled={snapshotting}
+            >
+              {snapshotting ? "Reading..." : "Save"}
             </Button>
             <Button
               variant="ghost"
               size="sm"
               className="h-7 text-xs text-fg-muted"
+              // Closed while a read is in flight: the panel would go away and the snapshot
+              // would still be written, which is a save nobody is watching for.
+              disabled={snapshotting}
               onClick={() => setShowLabelInput(false)}
             >
               {"Cancel"}
@@ -430,6 +556,16 @@ export function SchemaDiff({ schema, connection }: SchemaDiffProps) {
           <span className="text-xs">
             {`Current Schema is the explorer's last copy, which may be out of date: ${liveSchemaError}`}
           </span>
+        </div>
+      )}
+
+      {/* Its own line, because the panel's read can be failing at the same time and the two
+          are different facts: one says what Current Schema means, the other says a snapshot
+          you asked for was not written. Showing only the first left the second silent. */}
+      {snapshotError !== null && (
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-hairline bg-warning-tint/10 text-warning">
+          <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 shrink-0" />
+          <span className="text-xs">{`No snapshot was saved: ${snapshotError}`}</span>
         </div>
       )}
 
