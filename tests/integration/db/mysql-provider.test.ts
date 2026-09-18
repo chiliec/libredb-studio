@@ -2320,7 +2320,9 @@ describe("MySQLProvider", () => {
     });
 
     test("a pasted connection string asks for the same thing", async () => {
-      provider = new MySQLProvider(makeMySQLConfig({ connectionString: "mysql://example-user:example-fake-db-pw@localhost:3306/testdb" }));
+      provider = new MySQLProvider(
+        makeMySQLConfig({ connectionString: "mysql://example-user:example-fake-db-pw@localhost:3306/testdb" }),
+      );
       await provider.connect();
       expect(lastPoolConfig.supportBigNumbers).toBe(true);
       expect(lastPoolConfig.bigNumberStrings).toBeUndefined();
