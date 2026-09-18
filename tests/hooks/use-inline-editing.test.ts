@@ -60,10 +60,47 @@ const makeChange = (overrides: Partial<CellChange> = {}): CellChange => ({
 describe("useInlineEditing", () => {
   let mockExecuteQuery: ReturnType<typeof mock>;
 
+  /**
+   * The key check an apply now makes before it writes anything: one `COUNT(*)` over the
+   * keys about to be updated, which has to come back equal to how many there are. By
+   * default it does, so every test below is about what it was about before. The tests that
+   * are about the check answer it themselves.
+   */
+  function answerKeyCheck(matched?: number) {
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      void body;
+      // The shape the product actually answers with: `/api/db/query` returns rows as
+      // OBJECTS, and PostgreSQL reports a bare `COUNT(*)` as the string "1" under a column
+      // it names `count`. A mock returning `[[1]]` would exercise a branch the product
+      // never takes, and line coverage would not notice.
+      //
+      // One group per key, each holding one row, which is the shape that passes. Pass
+      // `matched` to answer a single group of that many rows instead — the key that does
+      // not tell its rows apart.
+      const body2 = JSON.parse(String(init?.body ?? "{}"));
+      // Where the dialect has no positional bind form the values are written into the
+      // statement instead, so there is no `params` to count: one group is the right answer
+      // for the single key those tests edit.
+      const bound = (body2.params ?? [1]) as unknown[];
+      const answer =
+        matched === undefined
+          ? bound.map((key) => ({ id: key, count: "1" }))
+          : matched === 0
+            ? []
+            : [{ id: bound[0], count: String(matched) }];
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ rows: answer, fields: ["id", "count"], rowCount: answer.length }),
+      });
+    }) as unknown as typeof fetch;
+  }
+
   beforeEach(() => {
     mockExecuteQuery = mock(() => {});
     mockToastSuccess.mockClear();
     mockToastError.mockClear();
+    answerKeyCheck();
   });
 
   afterEach(() => {
@@ -1293,5 +1330,661 @@ describe("useInlineEditing", () => {
     expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
       description: expect.stringContaining("no longer on screen"),
     });
+  });
+
+  // ── The key has to address one row ────────────────────────────────────────
+
+  test("refuses the whole apply when the key it found is not unique", async () => {
+    // The measured defect: a result carrying `category_id` and not `product_id` makes the
+    // guess land on the foreign key, and `UPDATE ... WHERE category_id = 5` rewrites every
+    // product in that category. Fifteen rows on the sample data, reported as one statement
+    // accepted. Nothing is written, and the reason names the column and both counts.
+    answerKeyCheck(15);
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [{ category_id: 5, product_name: "Chai" }],
+            fields: ["category_id", "product_name"],
+            rowCount: 1,
+          }),
+          query: "SELECT category_id, product_name FROM products",
+          resultQuery: "SELECT category_id, product_name FROM products",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange({
+        rowIndex: 0,
+        columnId: "product_name",
+        originalValue: "Chai",
+        newValue: "Chai Reserve",
+      });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("category_id does not tell these rows apart"),
+    });
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("15 rows"),
+    });
+    // The work stays on screen: nothing was written, so nothing is discarded.
+    expect(result.current.pendingChanges).toHaveLength(1);
+  });
+
+  test("refuses when that check cannot be run at all", async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve({ ok: false, json: () => Promise.resolve({ error: "connection refused" }) }),
+    ) as unknown as typeof fetch;
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    // A check that did not run is not a check that passed.
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("connection refused"),
+    });
+    expect(result.current.pendingChanges).toHaveLength(1);
+  });
+
+  test("refuses N rows that share one foreign key, without needing to ask the engine", async () => {
+    // The hole the first version of this check left open, and the one that matters most:
+    // three rows sharing `order_id` 87 sent `IN (87, 87, 87)`, the engine counted the three
+    // rows behind that one value, three equalled three, and all three UPDATEs wrote to all
+    // three rows. Measured on the sample data. Three rows on screen carrying one key
+    // between them is already the answer, so this refuses before any request goes out.
+    const seen: Array<{ params: unknown[] }> = [];
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      seen.push({ params: JSON.parse(String(init?.body ?? "{}")).params ?? [] });
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({ rows: [{ order_id: 87, count: "3" }], fields: ["order_id", "count"], rowCount: 1 }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [
+              { order_id: 87, quantity: 1 },
+              { order_id: 87, quantity: 2 },
+              { order_id: 87, quantity: 3 },
+            ],
+            fields: ["order_id", "quantity"],
+            rowCount: 3,
+          }),
+          resultQuery: "SELECT order_id, quantity FROM order_items",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      for (let i = 0; i < 3; i++) {
+        result.current.handleCellChange({ rowIndex: i, columnId: "quantity", originalValue: i + 1, newValue: "9" });
+      }
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    // Nothing was asked of the engine at all.
+    expect(seen).toHaveLength(0);
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("cannot tell these rows apart by order_id"),
+    });
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("3 rows on screen carry one value between them"),
+    });
+    expect(result.current.pendingChanges).toHaveLength(3);
+  });
+
+  test("refuses two rows whose keys arrived identical, whatever they are in the table", async () => {
+    // Measured on MySQL 8.4 through the product's own query route: `mysql2` rounds a BIGINT
+    // past 2^53, so a table holding 9007199254740992 and ...993 sends BOTH to the browser as
+    // ...992. One key would reach the engine, it would answer one group of one row, and two
+    // UPDATEs would then go out with the same WHERE - one row taking the other's value and
+    // the other never written, reported as two statements accepted. Two rows on screen
+    // carrying one key between them is the answer on its own, before anything is asked.
+    const seen: unknown[] = [];
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      seen.push(init);
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ rows: [{ id: 1, count: "1" }], fields: ["id", "count"], rowCount: 1 }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection({ type: "mysql" }),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [
+              { id: 9007199254740992, note: "first" },
+              { id: 9007199254740992, note: "second" },
+            ],
+            fields: ["id", "note"],
+            rowCount: 2,
+          }),
+          resultQuery: "SELECT id, note FROM big",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange({ rowIndex: 0, columnId: "note", originalValue: "first", newValue: "x" });
+      result.current.handleCellChange({ rowIndex: 1, columnId: "note", originalValue: "second", newValue: "y" });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(seen).toHaveLength(0);
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("2 rows on screen carry one value between them"),
+    });
+    expect(result.current.pendingChanges).toHaveLength(2);
+  });
+
+  test("keeps a text key and a numeric key apart, and lets the engine settle them", async () => {
+    // `bun:sqlite` hands back the text `1` and the integer 1 from the same dynamically typed
+    // column. Collapsing them by their text would ask about one key and write two; keeping
+    // the type asks about both, and SQLite answers two groups - one of them holding the two
+    // text rows, which is the refusal.
+    const seen: Array<{ params: unknown[] }> = [];
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      seen.push({ params: JSON.parse(String(init?.body ?? "{}")).params ?? [] });
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            rows: [
+              { id: "1", count: "2" },
+              { id: 1, count: "1" },
+            ],
+            fields: ["id", "count"],
+            rowCount: 2,
+          }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection({ type: "sqlite" }),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [
+              { id: "1", note: "text one" },
+              { id: 1, note: "number one" },
+            ],
+            fields: ["id", "note"],
+            rowCount: 2,
+          }),
+          resultQuery: "SELECT id, note FROM t",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange({ rowIndex: 0, columnId: "note", originalValue: "text one", newValue: "x" });
+      result.current.handleCellChange({ rowIndex: 1, columnId: "note", originalValue: "number one", newValue: "y" });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    // Both keys were asked about, not one.
+    expect(seen[0].params).toEqual(["1", 1]);
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("would write to 3 rows"),
+    });
+  });
+
+  test("asks inside the transaction when one is open, not beside it", async () => {
+    // The UPDATEs go to /api/db/transaction, which holds the one connection the transaction
+    // lives on. A check sent to /api/db/query takes a different pooled connection and cannot
+    // see anything the transaction has not committed: measured, a row INSERTed inside the
+    // open transaction is on screen, invisible to the check, and the apply refuses for ever
+    // with "no longer in the table" - false, about a row the user is looking at.
+    const seen: Array<{ url: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = mock((url: string, init?: RequestInit) => {
+      seen.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ rows: [{ id: 1, count: "1" }], fields: ["id", "count"], rowCount: 1 }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+        transactionActive: true,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].url).toBe("/api/db/transaction");
+    expect(seen[0].body.action).toBe("query");
+    expect(updateCalls()).toHaveLength(1);
+  });
+
+  test("asks for enough rows that a default page cannot cut the answer", async () => {
+    // Left to the default the answer is cut at 500 rows, and the groups that fell off would
+    // read as rows that are no longer in the table - a refusal with a false reason. The
+    // limit is the number of distinct keys plus one, which the answer can never reach.
+    const seen: Array<Record<string, unknown>> = [];
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? "{}")));
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            rows: [
+              { id: 1, count: "1" },
+              { id: 2, count: "1" },
+            ],
+            fields: ["id", "count"],
+            rowCount: 2,
+          }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+      result.current.handleCellChange({ rowIndex: 1, columnId: "name", originalValue: "Bob", newValue: "Bobby" });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect((seen[0].options as { limit: number }).limit).toBe(3);
+  });
+
+  test("reads the count by POSITION, because no two engines name it the same", async () => {
+    // PostgreSQL calls it `count`, MySQL and SQLite both call it `COUNT(*)`. Reading it by
+    // name would work on whichever one the test happened to imitate and refuse every apply
+    // on the others, so the mock here answers with MySQL's name.
+    globalThis.fetch = mock(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ rows: [{ id: 1, "COUNT(*)": 1 }], fields: ["id", "COUNT(*)"], rowCount: 1 }),
+      }),
+    ) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection({ type: "mysql" }),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    // It passed, which it could only do by reading the second value rather than a name.
+    expect(updateCalls()).toHaveLength(1);
+    expect(mockToastError).not.toHaveBeenCalled();
+  });
+
+  test("refuses two keys the ENGINE treats as one, which this side cannot see", async () => {
+    // The engine decides what counts as the same key, not JavaScript. MySQL's default
+    // collation is case-insensitive: `abc` and `ABC` are two distinct keys here and one
+    // key there. Measured on MySQL 8.4 - `IN ("abc", "ABC")` counts two rows, a plain
+    // total would read that as two keys matching two rows, and `WHERE k = "abc"` then
+    // writes to BOTH. Asked grouped, the engine answers ONE group holding two rows.
+    globalThis.fetch = mock(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({ rows: [{ user_id: "abc", count: "2" }], fields: ["user_id", "count"], rowCount: 1 }),
+      }),
+    ) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection({ type: "mysql" }),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [
+              { user_id: "abc", note: "one" },
+              { user_id: "ABC", note: "two" },
+            ],
+            fields: ["user_id", "note"],
+            rowCount: 2,
+          }),
+          resultQuery: "SELECT user_id, note FROM accounts",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange({ rowIndex: 0, columnId: "note", originalValue: "one", newValue: "x" });
+      result.current.handleCellChange({ rowIndex: 1, columnId: "note", originalValue: "two", newValue: "y" });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("user_id does not tell these rows apart"),
+    });
+    expect(result.current.pendingChanges).toHaveLength(2);
+  });
+
+  test("does not call the key unique when there are FEWER rows than keys", async () => {
+    // A row deleted under the user. The column may be perfectly unique, so saying it is not
+    // would be false, and telling them to add a key already in their query is no help.
+    answerKeyCheck(0);
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("no longer in the table"),
+    });
+    expect(mockToastError).not.toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("does not tell these rows apart"),
+    });
+  });
+
+  test("refuses a count it cannot read, rather than treating it as a pass", async () => {
+    // A group came back with nothing where the count should be. `Number(null)` is zero and
+    // would read as a real answer, so the row carries no second value at all.
+    globalThis.fetch = mock(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ rows: [{ id: 1 }], fields: ["id"], rowCount: 1 }),
+      }),
+    ) as unknown as typeof fetch;
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("returned no count"),
+    });
+  });
+
+  test("refuses a key that is an expression wearing a column's name", async () => {
+    // Measured against PostgreSQL 16. `SELECT ROW_NUMBER() OVER (ORDER BY product_name) AS
+    // product_id, product_name FROM products` puts 1, 2, 3 in a field called product_id;
+    // the table really has a product_id; the uniqueness check asks the table about 1 and 2
+    // and is told one row each, so all three of its conditions hold; and the UPDATEs then
+    // land on whichever products those are, not on the rows anyone was looking at. Two
+    // cells edited, two rows written, neither on screen, both reported as accepted.
+    const seen: unknown[] = [];
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      seen.push(init);
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            rows: [
+              { product_id: 1, count: "1" },
+              { product_id: 2, count: "1" },
+            ],
+            fields: ["product_id", "count"],
+            rowCount: 2,
+          }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [
+              { product_id: 1, product_name: "Alice Mutton 1" },
+              { product_id: 2, product_name: "Alice Mutton 2" },
+            ],
+            fields: ["product_id", "product_name"],
+            rowCount: 2,
+          }),
+          resultQuery: "SELECT ROW_NUMBER() OVER (ORDER BY product_name) AS product_id, product_name FROM products",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange({
+        rowIndex: 0,
+        columnId: "product_name",
+        originalValue: "Alice Mutton 1",
+        newValue: "x",
+      });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    // Refused before the engine is asked anything at all.
+    expect(seen).toHaveLength(0);
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("not read straight from the table"),
+    });
+    expect(result.current.pendingChanges).toHaveLength(1);
+  });
+
+  test("refuses a key that is another column renamed", async () => {
+    // The same defect spelled shorter: the WHERE would carry sku's value.
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({
+          result: makeResult({
+            rows: [{ product_id: "SKU-0001", product_name: "Chai" }],
+            fields: ["product_id", "product_name"],
+            rowCount: 1,
+          }),
+          resultQuery: "SELECT sku AS product_id, product_name FROM products",
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange({ rowIndex: 0, columnId: "product_name", originalValue: "Chai", newValue: "x" });
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("not read straight from the table"),
+    });
+  });
+
+  test("refuses a key value this editor cannot even read", async () => {
+    // A value with a null prototype has no `toString`, so turning it into text throws - and
+    // that happens before the request, outside the try that guards the request itself.
+    // Unguarded it left the apply as an unhandled rejection: no write, but no toast either.
+    const unreadable = Object.create(null) as Record<string, never>;
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({
+          result: makeResult({ rows: [{ id: unreadable, name: "Alice" }], fields: ["id", "name"], rowCount: 1 }),
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("cannot read the id of every row it would write to"),
+    });
+  });
+
+  test("refuses a row whose key is null before it sends anything", async () => {
+    answerKeyCheck();
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({
+          result: makeResult({ rows: [{ id: null, name: "Alice" }], fields: ["id", "name"], rowCount: 1 }),
+        }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("has no id"),
+    });
+  });
+
+  test("refuses when the check never reaches the server", async () => {
+    // A rejected request, not a refused one: the browser went offline mid-apply. Same
+    // answer as any other unanswered check, because an unanswered check is not a pass.
+    globalThis.fetch = mock(() => Promise.reject(new Error("Failed to fetch"))) as unknown as typeof fetch;
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab(),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(updateCalls()).toHaveLength(0);
+    expect(mockToastError).toHaveBeenCalledWith("Cannot Apply Changes", {
+      description: expect.stringContaining("Failed to fetch"),
+    });
+    expect(result.current.pendingChanges).toHaveLength(1);
+  });
+
+  test("the check is bound, not interpolated, and names the resolved table", async () => {
+    const seen: Array<{ sql: string; params: unknown[] }> = [];
+    globalThis.fetch = mock((_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seen.push({ sql: body.sql, params: body.params ?? [] });
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ rows: [{ id: 1, count: "1" }], fields: ["id", "count"], rowCount: 1 }),
+      });
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() =>
+      useInlineEditing({
+        activeConnection: makeConnection(),
+        currentTab: makeTab({ resultQuery: "SELECT * FROM public.users" }),
+        executeQuery: mockExecuteQuery,
+      }),
+    );
+
+    act(() => {
+      result.current.handleCellChange(makeChange());
+    });
+    await act(async () => {
+      await result.current.handleApplyChanges();
+    });
+
+    expect(seen).toHaveLength(1);
+    // The table the STATEMENT names, the same one the UPDATE will use.
+    expect(seen[0].sql).toContain("FROM public.users");
+    expect(seen[0].sql).toContain('"id", COUNT(*) FROM public.users WHERE "id" IN ($1) GROUP BY "id"');
+    // The value travels beside the statement, not inside it.
+    expect(seen[0].sql).not.toContain("IN (1)");
+    expect(seen[0].params).toEqual([1]);
   });
 });

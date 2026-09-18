@@ -5,12 +5,25 @@ import type { DatabaseConnection, QueryTab } from "@/lib/types";
 import type { CellChange } from "@/components/ResultsGrid";
 import { useToast } from "@/hooks/use-toast";
 import { quoteIdentifier } from "@/lib/sql/identifier";
-import { resolveUpdateTarget } from "@/lib/sql/update-target";
+import { resolveUpdateTarget, selectsPlainColumn } from "@/lib/sql/update-target";
 import { positionalPlaceholder, quoteLiteral } from "@/lib/sql/values";
+import { appFetch } from "@/lib/config/base-path";
+import { buildConnectionPayload } from "@/hooks/use-connection-payload";
 
 interface UseInlineEditingParams {
   activeConnection: DatabaseConnection | null;
   currentTab: QueryTab;
+  /**
+   * Whether a transaction is open on this connection.
+   *
+   * The UPDATEs already follow it: `executeQuery` sends them to `/api/db/transaction`,
+   * which holds the one reserved connection the transaction lives on. The key check has to
+   * follow it too, or it asks a different pooled connection and cannot see anything the
+   * transaction has not committed. Measured: a row INSERTed inside an open transaction is
+   * on screen, invisible to the check, and the apply refuses for ever with "no longer in
+   * the table" - a sentence that is false, about rows the user is looking at.
+   */
+  transactionActive?: boolean;
   /**
    * `useQueryExecution`'s `executeQuery`. `handleApplyChanges` awaits it between
    * rows and passes its execution options, so the signature carries both.
@@ -34,7 +47,143 @@ const rows = (count: number) => `${count} row${count === 1 ? "" : "s"}`;
 /** The same, for the statements a run is made of. */
 const updates = (count: number) => `${count} UPDATE statement${count === 1 ? "" : "s"}`;
 
-export function useInlineEditing({ activeConnection, currentTab, executeQuery }: UseInlineEditingParams) {
+/**
+ * Whether the column this editor found actually addresses ONE row per value.
+ *
+ * The key is a GUESS: the first field called `id` or ending in `_id`. On a result that
+ * carries a foreign key and not the table's own key — `SELECT category_id, product_name
+ * FROM products` — the guess lands on `category_id`, and the `UPDATE ... WHERE
+ * category_id = 5` that follows rewrites every product in that category. Measured on
+ * PostgreSQL 16 against the sample data: editing one cell changed FIFTEEN rows, and the
+ * apply reported one statement accepted, so nothing on screen said otherwise. Resolving
+ * the right TABLE (#881) does not help here; this is the right table and the wrong rows.
+ *
+ * One grouped count over the DISTINCT keys about to be written answers it for the whole
+ * apply: every group has to come back holding exactly one row, and there have to be as
+ * many groups as there are distinct keys.
+ *
+ * Distinct is the first word that matters. Counting the keys per ROW lets the defect
+ * straight back through: editing three rows that share `order_id` 87 sends `IN (87, 87,
+ * 87)`, the engine counts the three rows behind that one value, three equals three, and
+ * all three UPDATEs write to all three rows. Measured on the sample data — `order_items`
+ * has a composite key and the guess takes `order_id` — and editing a whole order's lines
+ * is the ordinary thing to do, so this needed no coincidence at all.
+ *
+ * GROUPED is the second, and a plain total would not have caught it: the engine decides
+ * what counts as the same key, not JavaScript. MySQL's default collation is
+ * case-insensitive, so two rows keyed `abc` and `ABC` are two distinct keys here and one
+ * key there. Measured on MySQL 8.4: `IN ('abc', 'ABC')` counts two rows, two equals two,
+ * and `WHERE k = 'abc'` then writes to BOTH. Grouped, the engine answers one group of two
+ * and the apply refuses. The same argument covers trailing spaces on CHAR columns and
+ * every other collation the engine applies and this side cannot see.
+ *
+ * A row that has gone missing is a different fact and gets a different sentence: fewer
+ * rows than keys says nothing about whether the column tells them apart.
+ *
+ * And the rows ON SCREEN have to answer as many keys as there are of them. Two grid rows
+ * that collapse to one key are not told apart by that column either, and this side cannot
+ * always see it: `bun:sqlite` hands back the text `'1'` and the integer `1` from the same
+ * dynamically typed column, and `mysql2` rounds a BIGINT past 2^53, so `9007199254740993`
+ * arrives as `...992` — the same number as its neighbour. Measured on both. In each case
+ * the engine was asked about ONE key, answered one group holding one row, and two UPDATEs
+ * then went out carrying the raw values the grid still held: a row the user never edited
+ * was overwritten and the apply reported success. So the dedup key carries the type as
+ * well as the text, and the number of edited rows has to equal the number of distinct keys.
+ *
+ * Refusing is what a failed check does: this exists to stop a write nobody asked for.
+ */
+async function keyAddressesOneRow(
+  connection: DatabaseConnection,
+  table: string,
+  keyColumn: string,
+  keys: readonly unknown[],
+  inTransaction: boolean,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  // A key with no value cannot be addressed by `=` at all, and `String(null)` would send
+  // the text "null" — which an integer column rejects, so the whole apply would fail on a
+  // driver error rather than on the reason.
+  if (keys.some((key) => key === null || key === undefined)) {
+    return { ok: false, reason: `a row you edited has no ${keyColumn}, so it cannot be addressed` };
+  }
+  // Safe to read as text: the caller has already refused any key this would throw on.
+  const distinct = [...new Map(keys.map((key) => [`${typeof key}:${String(key)}`, key])).values()];
+  if (distinct.length !== keys.length) {
+    return {
+      ok: false,
+      reason:
+        `This editor cannot tell these rows apart by ${keyColumn}: ${rows(keys.length)} on screen carry ` +
+        `${distinct.length === 1 ? "one value" : `only ${distinct.length} values`} between them. ` +
+        `Put a key that identifies a row in the query and run it again`,
+    };
+  }
+
+  const dialect = connection.type;
+  const params: unknown[] = [];
+  const placeholders = distinct.map((key) => {
+    const placeholder = positionalPlaceholder(dialect, params.length + 1);
+    if (placeholder !== null) {
+      params.push(typeof key === "number" ? key : String(key));
+      return placeholder;
+    }
+    return typeof key === "number" ? String(key) : quoteLiteral(String(key), dialect);
+  });
+  const key = quoteIdentifier(keyColumn, dialect);
+  const sql = `SELECT ${key}, COUNT(*) FROM ${table} WHERE ${key} IN (${placeholders.join(", ")}) GROUP BY ${key}`;
+
+  let data: { rows?: Record<string, unknown>[]; error?: string };
+  try {
+    const res = await appFetch(inTransaction ? "/api/db/transaction" : "/api/db/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...buildConnectionPayload(connection),
+        ...(inTransaction && { action: "query" }),
+        sql,
+        // A limit the answer cannot reach: one group per distinct key, and the keys are the
+        // rows a person edited by hand. Left to the default the answer would be cut at 500
+        // and the missing groups would read as missing ROWS, which is a refusal with a false
+        // reason attached.
+        options: { limit: distinct.length + 1 },
+        ...(params.length > 0 && { params }),
+      }),
+    });
+    // A proxy answering HTML rather than JSON would throw here, and the catch below is
+    // what turns that into a refusal instead of an unhandled rejection.
+    data = await res.json();
+    if (!res.ok) return { ok: false, reason: data.error ?? "the check could not be run" };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+
+  // `/api/db/query` answers rows as objects, always, and the name a bare `COUNT(*)` comes
+  // back under is the engine's business: `count` on PostgreSQL, `COUNT(*)` on MySQL and
+  // SQLite. So the count is read by POSITION — second value of each row, after the key —
+  // rather than by a name no dialect agrees on. PostgreSQL returns it as a STRING, which
+  // is why it goes through `Number`.
+  const groups = data.rows ?? [];
+  const counts = groups.map((row) => Number(Object.values(row)[1]));
+  if (counts.some((count) => !Number.isFinite(count))) {
+    return { ok: false, reason: "the check returned no count" };
+  }
+  const matched = counts.reduce((total, count) => total + count, 0);
+  if (groups.length === distinct.length && counts.every((count) => count === 1)) return { ok: true };
+  if (matched < distinct.length) {
+    return { ok: false, reason: "some of the rows you edited are no longer in the table. Run the query again" };
+  }
+  return {
+    ok: false,
+    reason:
+      `${keyColumn} does not tell these rows apart in this table: the ${rows(distinct.length)} you edited ` +
+      `would write to ${rows(matched)}. Put the table's own key in the query and run it again`,
+  };
+}
+
+export function useInlineEditing({
+  activeConnection,
+  currentTab,
+  executeQuery,
+  transactionActive = false,
+}: UseInlineEditingParams) {
   const [editingEnabled, setEditingEnabled] = useState(false);
   const [pendingChanges, setPendingChanges] = useState<CellChange[]>([]);
   const { toast } = useToast();
@@ -145,6 +294,26 @@ export function useInlineEditing({ activeConnection, currentTab, executeQuery }:
     const dialect = activeConnection.type;
     const quote = (identifier: string) => quoteIdentifier(identifier, dialect);
 
+    // Every key has to survive being read as text before anything is built from it. A value
+    // with a null prototype has no `toString`, and `String()` throws on it - which happened
+    // where the statement is assembled, so the apply died as an unhandled rejection with no
+    // write and no toast either. Asked here, it is a refusal like any other.
+    const keysByRow = new Map<number, unknown>();
+    for (const rowIndex of changesByRow.keys()) {
+      const value = currentTab.result.rows[rowIndex]?.[pkColumn];
+      try {
+        void String(value);
+      } catch {
+        toast({
+          title: "Cannot Apply Changes",
+          description: `This editor cannot read the ${pkColumn} of every row it would write to. Edit the SQL manually.`,
+          variant: "destructive",
+        });
+        return;
+      }
+      keysByRow.set(rowIndex, value);
+    }
+
     // Generate UPDATE statements
     const statements: Array<{ sql: string; params: unknown[]; rowIndex: number }> = [];
     for (const [rowIndex, changes] of changesByRow) {
@@ -186,6 +355,42 @@ export function useInlineEditing({ activeConnection, currentTab, executeQuery }:
         params,
         rowIndex,
       });
+    }
+
+    // Before anything is written: is that key column the TABLE's, and does it address one
+    // row per value? The first question comes first because it decides whether the second
+    // one is even being asked about the right thing: a key that is an expression or a
+    // rename sends the check to a real column the grid never showed, and every answer it
+    // gives is about rows nobody is looking at.
+    if (!selectsPlainColumn(currentTab.resultQuery ?? currentTab.query, pkColumn, activeConnection.type)) {
+      toast({
+        title: "Cannot Apply Changes",
+        description: `${pkColumn} is not read straight from the table here, so it cannot identify a row to write to. Edit the SQL manually.`,
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // And then: does that key column address one row per value?
+    // `pkColumn` is a guess off the field list, and on a result carrying a foreign key
+    // rather than the table's own key it aims at the foreign key — one cell edit then
+    // rewrote fifteen rows, reported as one statement accepted.
+    const uniqueness = await keyAddressesOneRow(
+      activeConnection,
+      tableName,
+      pkColumn,
+      // The RAW cell values. Converting here would turn a missing key into the text
+      // "null" before the check could see it was missing.
+      statements.map((statement) => keysByRow.get(statement.rowIndex)),
+      transactionActive,
+    );
+    if (!uniqueness.ok) {
+      toast({
+        title: "Cannot Apply Changes",
+        description: `${uniqueness.reason}.`,
+        variant: "destructive",
+      });
+      return;
     }
 
     // One request per row (issue #269), sequentially and with the safety dialog
@@ -273,7 +478,7 @@ export function useInlineEditing({ activeConnection, currentTab, executeQuery }:
           ? `${updates(statements.length)} accepted. Run the query again to see the saved rows.`
           : `${updates(statements.length)} accepted. The results are up to date.`,
     });
-  }, [activeConnection, currentTab, pendingChanges, executeQuery, toast]);
+  }, [activeConnection, currentTab, pendingChanges, executeQuery, toast, transactionActive]);
 
   const handleDiscardChanges = useCallback(() => {
     setPendingChanges([]);
