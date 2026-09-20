@@ -984,6 +984,31 @@ describe("SchemaDiagram", () => {
       expect(container.querySelector(`[data-node-id="${pathKey(["public", "products"])}"]`)).not.toBeNull();
     });
 
+    test("tooltip tells an empty-string default apart from no default", () => {
+      const fixture: DetailedObject[] = [
+        {
+          name: "probe",
+          kind: "table",
+          path: ["probe"],
+          columns: [
+            { name: "d", type: "varchar", nullable: true, isPrimary: false, defaultValue: "abc" },
+            { name: "k", type: "varchar", nullable: true, isPrimary: false, defaultValue: "" },
+            { name: "n", type: "varchar", nullable: true, isPrimary: false, defaultValue: undefined },
+          ],
+          indexes: [],
+          foreignKeys: [],
+          rowCount: 0,
+        },
+      ];
+      const props = createDefaultProps({ schema: fixture });
+      const { container } = render(<SchemaDiagram {...props} />);
+
+      const titles = Array.from(container.querySelectorAll("[title]")).map((el) => el.getAttribute("title"));
+      expect(titles).toContain("d: varchar\nDefault: abc");
+      expect(titles).toContain("k: varchar\nDefault: '' (empty string)");
+      expect(titles).toContain("n: varchar");
+    });
+
     test("node with empty/null data returns nothing", () => {
       // Schema with a valid table ensures at least one node renders
       // The guard `if (!data) return null; if (!table) return null;` is tested

@@ -22,7 +22,11 @@ const ColumnRow = memo(function ColumnRow({ column, isFk, hasSourceHandle, hasTa
     column.isPrimary ? "PRIMARY KEY" : null,
     isFk ? "FOREIGN KEY" : null,
     column.nullable === false ? "NOT NULL" : null,
-    column.defaultValue ? `Default: ${column.defaultValue}` : null,
+    column.defaultValue === undefined
+      ? null
+      : column.defaultValue === ""
+        ? "Default: '' (empty string)"
+        : `Default: ${column.defaultValue}`,
   ]
     .filter(Boolean)
     .join("\n");
