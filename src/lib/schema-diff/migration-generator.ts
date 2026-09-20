@@ -38,6 +38,12 @@ function clickhouseDefaultKind(value: string): string {
   return CLICKHOUSE_DEFAULT_KINDS.find((kind) => value.startsWith(`${kind} `)) ?? "DEFAULT";
 }
 
+function defaultClause(value: string | undefined, dialect: DatabaseType): string {
+  if (!value) return "";
+  if (dialect === "clickhouse" && clickhouseDefaultKind(value) !== "DEFAULT") return ` ${value}`;
+  return ` DEFAULT ${value}`;
+}
+
 /**
  * Canonical type ids whose engine has no column-modification statement at all.
  *
@@ -229,7 +235,7 @@ function generateColumnDef(col: ColumnDiff, dialect: DatabaseType): string {
   // component cannot be null) and there are no defaults at all.
   if (dialect === "cassandra") return `${escapeIdentifier(col.columnName, dialect)} ${type}`;
   const nullable = col.targetNullable === false ? " NOT NULL" : "";
-  const defaultVal = col.targetDefault ? ` DEFAULT ${col.targetDefault}` : "";
+  const defaultVal = defaultClause(col.targetDefault, dialect);
   // Oracle's column grammar puts DEFAULT before inline constraints such as NOT NULL.
   const modifiers = dialect === "oracle" ? `${defaultVal}${nullable}` : `${nullable}${defaultVal}`;
   return `${escapeIdentifier(col.columnName, dialect)} ${type}${modifiers}`;
@@ -527,11 +533,7 @@ function generateAlterTable(table: TableDiff, dialect: DatabaseType): string {
         // (live-probed). See CLICKHOUSE_DEFAULT_KINDS for the kind vocabulary and its traps.
         const column = escapeIdentifier(col.columnName, dialect);
         const type = col.targetType || col.sourceType || "String";
-        let declared = "";
-        if (col.targetDefault) {
-          const kind = clickhouseDefaultKind(col.targetDefault);
-          declared = kind === "DEFAULT" ? ` DEFAULT ${col.targetDefault}` : ` ${col.targetDefault}`;
-        }
+        const declared = defaultClause(col.targetDefault, dialect);
         lines.push(`ALTER TABLE ${id} MODIFY COLUMN ${column} ${type}${declared};`);
         if (col.sourceDefault && !col.targetDefault) {
           const kind = clickhouseDefaultKind(col.sourceDefault);
