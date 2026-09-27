@@ -1174,6 +1174,7 @@ because there are no table statistics to list at all.)
   schemaRefreshPattern: "\\b(CREATE|DROP|ALTER)\\b",
   containerLevels: [{ id: "schema", label: "Keyspace", labelPlural: "Keyspaces" }], // one level: CQL has none above a keyspace and none below it (§6.4)
   containerPathShapes: "exact",      // only [keyspace] addresses a container; any other path is refused (§6.4, #1147)
+  objectKinds: ["table", "materialized_view", "index", "type", "function", "aggregate", "trigger"], // declared in this order (§6.4)
 }
 ```
 
