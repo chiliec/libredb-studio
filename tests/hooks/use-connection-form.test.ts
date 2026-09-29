@@ -2464,8 +2464,7 @@ describe("useConnectionForm", () => {
     expect("sshTunnel" in onConnect.mock.calls[0][0]).toBe(false);
   });
 
-  test("a tunnel left in the dialog's state by the connection edited before is not sent for a Kafka edit", async () => {
-    // The write gate is what keeps a tunnel off a Kafka connection.
+  test("a Kafka edit after a tunnelled one opens with the tunnel off", async () => {
     const fetchMock = mockGlobalFetch({
       "/api/db/test-connection": { ok: true, json: { success: true, latency: 5 } },
     });
